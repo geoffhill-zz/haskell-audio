@@ -1,41 +1,57 @@
-import qualified Data.Map as Map
 import Control.Applicative
 import Control.Monad
 import Control.Monad.State
+import qualified Data.Map as Map
+import qualified Data.Binary.Put as P
+import qualified Data.ByteString.Lazy.Char8 as B
+import Data.Word
 
 -- Time
 
 sampleRate :: (Num a) => a
 sampleRate = 192000
 
-data Time a = Instant | Samples a | Seconds a | Minutes a | Forever
+bytesPerSample :: (Num a) => a
+bytesPerSample = 3
+
+data Time = Instant | Samples Rational | Seconds Rational | Minutes Rational | Forever deriving Eq
 (inst, spl, sec, mins, inf) = (Instant, Samples, Seconds, Minutes, Forever)
 
-bpm :: (Fractional a) => a -> a -> Time a
+bpm :: Rational -> Rational -> Time
 bpm x n = Minutes $ n / x
 
-spls :: (Num a) => Time a -> Maybe a
+spls :: Time -> Maybe Rational
 spls Instant = Just $ 0
 spls (Samples i) = Just $ i
 spls (Seconds i) = Just $ i * sampleRate
 spls (Minutes i) = Just $ i * 60 * sampleRate
 spls Forever = Nothing
 
+tapp op x = op <$> spls x
+tapp2 op x y = op <$> spls x <*> spls y
+
+tconv op x = propInf $ tapp op x
+tconv2 op x y = propInf $ tapp2 op x y
 propInf Nothing = Forever
 propInf (Just x) = Samples x
-tapp op x = propInf $ op <$> spls x
-tapp2 op x y = propInf $ op <$> spls x <*> spls y
 
-instance (Num a) => Num (Time a) where
-    (+) = tapp2 (+)
-    (*) = tapp2 (*)
-    (-) = tapp2 (-)
-    negate = tapp negate
-    abs = tapp abs
-    signum = tapp signum
+instance Num Time where
+    (+) = tconv2 (+)
+    (*) = tconv2 (*)
+    (-) = tconv2 (-)
+    negate = tconv negate
+    abs = tconv abs
+    signum = tconv signum
     fromInteger = Samples . fromInteger
 
-instance (Show a) => Show (Time a) where
+instance Ord Time where
+    Forever `compare` Forever = EQ
+    Forever `compare` y = GT
+    x `compare` Forever = LT
+    x `compare` y = case tapp2 compare x y of Nothing -> EQ
+                                              (Just x) -> x
+
+instance Show Time where
     show Instant = show 0
     show (Samples i) = show i
     show (Seconds i) = show i ++ "s"
@@ -46,6 +62,7 @@ instance (Show a) => Show (Time a) where
 
 type Freq = Double
 type Volume = Double
+type SampleNum = Integer
 type WavePoint = Double
 type WavePoint2 = (WavePoint, WavePoint)
 
@@ -70,8 +87,8 @@ noteS "G#" = 830.61
 noteS "Ab" = 830.61
 noteS _ = 440.0
 
-newtype GeneratorFn = GeneratorFn { getGenFn :: Integer -> WavePoint2 }
-newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Integer -> WavePoint2 -> WavePoint2 }
+newtype GeneratorFn = GeneratorFn { getGenFn :: SampleNum -> WavePoint2 }
+newtype AdjustmentFn = AdjustmentFn { getAdjFn :: SampleNum -> WavePoint2 -> WavePoint2 }
 
 mkLeftGen f = GeneratorFn $ \i -> (f i, 0)
 mkRightGen f = GeneratorFn $ \i -> (0, f i)
@@ -83,52 +100,67 @@ mkRightAdj f = AdjustmentFn $ \i -> \(l, r) -> (l, f i r)
 mkMonoAdj f = AdjustmentFn $ \i -> \(l, r) -> (f i l, f i r)
 mkStereoAdj = AdjustmentFn
 
-
 -- Player
 
-data Stream a = Generator { streamStart :: Time a
-                          , streamEnd :: Time a
-                          , generator :: GeneratorFn }
-              | Adjustment { streamStart :: Time a
-                           , streamEnd :: Time a
-                           , adjustment :: AdjustmentFn
-                           , source :: Stream a }
+data Stream = Generator { streamStart :: Time
+                        , streamEnd :: Time
+                        , generator :: GeneratorFn }
+            | Adjustment { streamStart :: Time
+                         , streamEnd :: Time
+                         , adjustment :: AdjustmentFn
+                         , original :: Stream }
 
-instance (Show a) => Show (Stream a) where
+instance Show Stream where
     show (Generator s e _) = concat ["GEN(", show s, "-", show e, ")"]
     show (Adjustment s e _ o) = concat ["ADJ(", show s, "-", show e, ") {", show o, "}"]
 
+evalStreams :: SampleNum -> [Stream] -> WavePoint2
+evalStreams i = sum2 . map (evalStream i)
+    where sum2 = foldl accum (0, 0)
+          accum (ls, lr) (l, r) = (ls+l, lr+r)
+
+evalStream :: SampleNum -> Stream -> WavePoint2
+evalStream i (Generator s e g) | fromInteger i < s = (0,0)
+                               | fromInteger i > e = (0,0)
+                               | otherwise = evalGen (fromInteger i - s) g
+evalStream i (Adjustment s e a o) | fromInteger i < s = (0,0)
+                                  | fromInteger i > e = (0,0)
+                                  | otherwise = evalAdj (fromInteger i - s) a (evalStream i o)
+
+evalGen :: Time -> GeneratorFn -> WavePoint2
+evalGen i 
+
 type StreamKey = Integer
-data Player a = Player { allStreams :: Map.Map StreamKey (Stream a)
-                       , currentTime :: Time a} deriving Show
+data Player = Player { allStreams :: Map.Map StreamKey Stream
+                     , currentTime :: Time } deriving Show
 
 getMaxKey :: (Num k) => Map.Map k a -> k
 getMaxKey as = case Map.maxViewWithKey as of Nothing -> 0
                                              Just ((k, _), _) -> k
 
-execAndGetStreams :: (Num a) => State (Player a) b -> [Stream a]
+execAndGetStreams :: State Player a -> [Stream]
 execAndGetStreams c = Map.elems $ allStreams finalState
     where finalState = execState c initialState
           initialState = Player Map.empty 0
 
-play :: (Num a) => Time a -> GeneratorFn -> State (Player a) StreamKey
+play :: Time -> GeneratorFn -> State Player StreamKey
 play d g = state $ \(Player as t) ->
     (nextKey as, Player (Map.insert (nextKey as) (gen t) as) t)
         where nextKey = (+1) . getMaxKey
               gen t = Generator t (t + d) g
 
-patch :: (Num a) => Time a -> StreamKey -> AdjustmentFn -> State (Player a) StreamKey
+patch :: Time -> StreamKey -> AdjustmentFn -> State Player StreamKey
 patch d k a = state $ \(Player as t) ->
     (k, Player (Map.adjust (\s -> adj t s) k as) t)
         where adj t s = Adjustment t (t + d) a s
 
-wait :: (Num a) => Time a -> State (Player a) ()
+wait :: Time -> State Player ()
 wait d = state $ \(Player as t) -> ((), Player as (t + d))
 
-stopAll :: State (Player a) ()
+stopAll :: State Player ()
 stopAll = state $ \(Player as t) -> ((), Player (Map.map (\s -> s {streamEnd = t}) as) t)
 
-stop :: StreamKey -> State (Player a) StreamKey
+stop :: StreamKey -> State Player StreamKey
 stop k = state $ \(Player as t) -> (k, Player (Map.adjust (\s -> s {streamEnd = t}) k as) t)
 
 playF = play Forever
@@ -137,9 +169,31 @@ playAndWait d g = play d g >>= (\k -> wait d >> return k)
 
 -- Encoder
 
-writeWaveFile :: (Num a) => FilePath -> State (Player a) b -> IO ()
-writeWaveFile fp c = print $ execAndGetStreams melody 
+writeWAVFile :: FilePath -> State Player a -> IO ()
+writeWAVFile fp c = B.putStr $ genWAVFile c
 
+genWAVFile :: State Player a -> B.ByteString
+genWAVFile = (P.runPut . putWAV . mix . execAndGetStreams)
+
+putWAV :: (Word32, B.ByteString) -> P.Put
+putWAV (numSamples, sampleData) = do
+    P.putLazyByteString $ B.pack "RIFF"
+    P.putWord32le 0
+    P.putLazyByteString $ B.pack "WAVE"
+    P.putLazyByteString $ B.pack "fmt "
+    P.putWord32le 16   -- Subchunk Size
+    P.putWord16le 1    -- Audio Format (PCM)
+    P.putWord16le 2    -- Num Channels
+    P.putWord32le sampleRate
+    P.putWord32le $ sampleRate * 2 * bytesPerSample
+    P.putWord16le $ 2 * bytesPerSample
+    P.putWord16le $ 8 * bytesPerSample
+    P.putLazyByteString $ B.pack "data"
+    P.putWord32le $ numSamples * 2 * bytesPerSample
+    P.putLazyByteString sampleData
+    
+mix :: [Stream] -> (Word32, B.ByteString)
+mix as = (0, B.pack "")
 
 -- Example
 
@@ -165,4 +219,4 @@ melody = do
     wait (beat 11)
     stopAll
 
-main = print $ execAndGetStreams melody
+main = writeWAVFile "sample.wav" melody

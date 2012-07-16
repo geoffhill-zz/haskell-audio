@@ -82,12 +82,12 @@ newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Sample -> WavePoint2 -> WavePo
 
 mkLeftGen f = GeneratorFn $ \i -> (f $ fromIntegral i, 0)
 mkRightGen f = GeneratorFn $ \i -> (0, f $ fromIntegral i)
-mkMonoGen f = GeneratorFn $ \i -> (f $ fromIntegral i, f $ fromIntegral i)
+mkMonoGen f = GeneratorFn $ \i -> let x = fromIntegral i in (f x, f x)
 mkStereoGen f = GeneratorFn $ \i -> f $ fromIntegral i
 
 mkLeftAdj f = AdjustmentFn $ \i -> \(l, r) -> (f (fromIntegral i) l, r)
 mkRightAdj f = AdjustmentFn $ \i -> \(l, r) -> (l, f (fromIntegral i) r)
-mkMonoAdj f = AdjustmentFn $ \i -> \(l, r) -> (f (fromIntegral i) l, f (fromIntegral i) r)
+mkMonoAdj f = AdjustmentFn $ \i -> \(l, r) -> let x = fromIntegral i in (f x l, f x r)
 mkStereoAdj f = AdjustmentFn $ \i -> f $ fromIntegral i
 
 -- Player
@@ -167,6 +167,7 @@ stop k = state $ \(Player as t) -> (k, Player (M.adjust (stopIfPlaying t) k as) 
 -- playF = play inf
 -- patchF = patch inf
 playAndWait d g = play d g >>= (\k -> wait d >> return k)
+patchAndWait d k a = patch d k a >>= (\k -> wait d >> return k)
 
 -- Encoder
 
@@ -230,23 +231,48 @@ sawtooth f v = mkMonoGen $ \i -> let x = i * f in 2 * v * (x - fromIntegral (flo
 amplify :: Volume -> AdjustmentFn
 amplify v = mkMonoAdj $ \_ -> \x -> v * x
 
-beat = bpm 60.0
+-- Examples
 
-melody = do
-    chord sine
-    chord sawtooth
+example1 = do
+    play (beat 4) (sine (note "C") 0.3)
+    wait (beat 1)
+    play (beat 3) (sine (note "E") 0.2)
+    wait (beat 1)
+    play (beat 2) (sine (note "G") 0.2)
+    wait (beat 3)
+    where beat = bpm 80.0
 
-chord s = do
-    play (beat 4) (s (note "C") 0.3)
+example2 = mapM f ns
+    where beat = bpm 140.0
+          f n = playAndWait (beat 1) (sine (note n) 0.3)
+          ns = ["F","G","A","Bb","C","D","E","F"
+               ,"E","D","C","Bb","A","G","F","F"]
+
+example3 = chord sine >> chord sawtooth
+    where beat = bpm 80.0
+          chord s = do
+              play (beat 4) (s (note "C") 0.3)
+              wait (beat 1)
+              play (beat 3) (s (note "E") 0.2)
+              wait (beat 1)
+              play (beat 2) (s (note "G") 0.2)
+              wait (beat 3)
+
+example4 = do
+    c <- play (beat 6) (sine (note "C") 0.3)
     wait (beat 1)
-    play (beat 3) (s (note "E") 0.2)
-    wait (beat 1)
-    play (beat 2) (s (note "G") 0.2)
-    wait (beat 2)
+    patch (beat 5) c (amplify 2)
+    where beat = bpm 120.0
     
-    -- mapM_ (\n -> play inf (sine (note n) 0.2)) ["G","F","G"]
-    -- wait (beat 1)
-    -- patch inf c (amplify 2)
-    -- patch inf d (amplify 2)
 
-main = writeWAVFile "sample.wav" melody
+example5 = do
+    c <- play inf (sine (note "C") 0.3)
+    rampVolume c
+    rampVolume c
+    rampVolume c
+    stopAll
+    where rampVolume x = do
+              patch inf x (amplify 1.2)
+              wait (secs 1)
+
+main = writeWAVFile "sample.wav" example5

@@ -104,6 +104,14 @@ instance Show Stream where
     show (Generator s e _) = concat ["GEN(", show s, "-", show e, ")"]
     show (Adjustment s e _ o) = concat ["ADJ(", show s, "-", show e, ") {", show o, "}"]
 
+generationStart :: Stream -> Time
+generationStart (Generator s _ _) = s
+generationStart (Adjustment _ _ _ o) = generationEnd o
+
+generationEnd :: Stream -> Time
+generationEnd (Generator _ e _) = e
+generationEnd (Adjustment _ _ _ o) = generationEnd o
+
 evalStreams :: Sample -> [Stream] -> WavePoint2
 evalStreams i = clip2 . sum2 . map (evalStream i)
     where sum2 = foldl accum (0, 0)
@@ -149,7 +157,7 @@ play d g = state $ \(Player as t) ->
 
 patch :: Time -> StreamKey -> AdjustmentFn -> PlayerState StreamKey
 patch d k a = state $ \(Player as t) ->
-    (k, Player (M.adjust (\s -> adj t s) k as) t)
+    (k, Player (M.adjust (adj t) k as) t)
         where adj t s = Adjustment t (t + d) a s
 
 wait :: Time -> PlayerState ()
@@ -180,7 +188,7 @@ genWAVFile = P.runPut . putWAV . mix . execAndGetStreams
 putWAV :: (Sample, P.Put) -> P.Put
 putWAV (numSamples, audioDataPut) = do
     P.putLazyByteString $ B.pack riff
-    P.putWord32le $ fromInteger $ 36 + sub2Size
+    P.putWord32le $ 36 + sub2Size
     P.putLazyByteString $ B.pack wave
     P.putLazyByteString $ B.pack fmt
     P.putWord32le 16          -- Subchunk Size
@@ -191,18 +199,18 @@ putWAV (numSamples, audioDataPut) = do
     P.putWord16le $ 2 * bytesPerSample
     P.putWord16le $ 8 * bytesPerSample
     P.putLazyByteString $ B.pack dataS
-    P.putWord32le $ fromInteger $ sub2Size
+    P.putWord32le $ sub2Size
     audioDataPut
         where riff = [0x52, 0x49, 0x46, 0x46]
               wave = [0x57, 0x41, 0x56, 0x45]
               fmt = [0x66, 0x6d, 0x74, 0x20]
               dataS = [0x64, 0x61, 0x74, 0x61]
-              sub2Size = numSamples * 2 * bytesPerSample
+              sub2Size = fromInteger $ numSamples * 2 * bytesPerSample
 
 mix :: ([Stream], Time) -> (Sample, P.Put)
 mix (as, t) = (numSamples, mapM_ (encodeStreams as) [1..numSamples])
     where numSamples = timeToSamples timeSamples
-          timeSamples = foldl maxTime t (map streamEnd as)
+          timeSamples = foldl maxTime t (map generationEnd as)
           timeToSamples Infinite = 0
           timeToSamples (Finite x) = x
 
@@ -230,6 +238,11 @@ sawtooth f v = mkMonoGen $ \i -> let x = i * f in 2 * v * (x - fromIntegral (flo
 
 amplify :: Volume -> AdjustmentFn
 amplify v = mkMonoAdj $ \_ -> \x -> v * x
+
+fadeIn :: Time -> AdjustmentFn
+fadeIn Infinite = mkMonoAdj $ \_ -> \_ -> 0
+fadeIn (Finite s) = mkMonoAdj $ \i -> \x -> if i < t then (t - i) * x else x
+    where t = fromIntegral s
 
 -- Examples
 
@@ -259,20 +272,24 @@ example3 = chord sine >> chord sawtooth
               wait (beat 3)
 
 example4 = do
-    c <- play (beat 6) (sine (note "C") 0.3)
-    wait (beat 1)
-    patch (beat 5) c (amplify 2)
+    c <- play (beat 5) (sine (note "C") 0.3)
+    patch inf c (fadeIn (beat 1))
     where beat = bpm 120.0
-    
 
 example5 = do
-    c <- play inf (sine (note "C") 0.3)
+    c <- play (beat 5) (sine (note "C") 0.3)
+    wait (beat 1)
+    patch (beat 2) c (amplify 1.8)
+    where beat = bpm 120.0
+
+example6 = do
+    c <- play inf (sine (note "F#") 0.3)
     rampVolume c
     rampVolume c
     rampVolume c
     stopAll
     where rampVolume x = do
-              patch inf x (amplify 1.2)
+              patch inf x (amplify 1.25)
               wait (secs 1)
 
 main = writeWAVFile "sample.wav" example5

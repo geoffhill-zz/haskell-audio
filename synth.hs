@@ -222,10 +222,10 @@ encodeBytes (l, r) n = do
 -- Example
 
 sine :: Freq -> Volume -> GeneratorFn
-sine f v = mkMonoGen $ \i -> v * (sin $ i * 2 * pi * f)
+sine f v = mkMonoGen $ \i -> v * (sin $ 2 * pi * i * f)
 
 sawtooth :: Freq -> Volume -> GeneratorFn
-sawtooth f v = mkMonoGen $ \i -> 2 * v * (((fromIntegral i) * f) - fromIntegral (floor (((fromIntegral i) * f) - 0.5)) - 1.0)
+sawtooth f v = mkMonoGen $ \i -> let x = i * f in 2 * v * (x - fromIntegral (floor x) - 0.5)
 
 amplify :: Volume -> AdjustmentFn
 amplify v = mkMonoAdj $ \_ -> \x -> v * x
@@ -237,9 +237,12 @@ melody = do
     chord sawtooth
 
 chord s = do
-    playAndWait (beat 1) (s (note "C") 0.3)
-    playAndWait (beat 1) (s (note "E") 0.2)
-    playAndWait (beat 1) (s (note "G") 0.2)
+    play (beat 4) (s (note "C") 0.3)
+    wait (beat 1)
+    play (beat 3) (s (note "E") 0.2)
+    wait (beat 1)
+    play (beat 2) (s (note "G") 0.2)
+    wait (beat 2)
     
     -- mapM_ (\n -> play inf (sine (note n) 0.2)) ["G","F","G"]
     -- wait (beat 1)

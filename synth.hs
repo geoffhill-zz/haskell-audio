@@ -1,3 +1,7 @@
+{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving #-}
+
+module Main where
+
 import Control.Applicative
 import Control.Monad
 import Control.Monad.State
@@ -6,23 +10,33 @@ import qualified Data.Binary.Put as P
 import Data.Bits
 import qualified Data.ByteString.Lazy as B
 import Data.Int
+import Data.Ratio ((%))
+import Data.List (foldl')
 import Data.Word
+import Debug.Trace
 
 -- Time
 
-type Sample = Integer
-data Time = Infinite | Finite Sample deriving Eq
+type Picosecond = Int64
+data Time = Infinite | Finite Picosecond deriving (Eq, Read, Show)
+
+timeMaybe :: a -> (Picosecond -> a) -> Time -> a
+timeMaybe x _ Infinite = x
+timeMaybe _ f (Finite y) = f y
+
+timeTryOrInf :: (Picosecond -> Picosecond) -> Time -> Time
+timeTryOrInf f = timeMaybe Infinite (Finite . f)
+
+timeTryOrInf3 :: (Picosecond -> Picosecond -> Picosecond) -> Time -> Time -> Time
+timeTryOrInf3 f x y = timeMaybe Infinite g x
+    where g s = timeMaybe Infinite (Finite . (f s)) y
 
 instance Num Time where
-    (+) (Finite x) (Finite y) = Finite $ x + y
-    (+) _ _ = Infinite
-    (*) (Finite x) (Finite y) = Finite $ x * y
-    (*) _ _ = Infinite
-    abs Infinite = Infinite
-    abs (Finite x) = Finite $ abs x
-    signum Infinite = Infinite
-    signum (Finite x) = Finite $ signum x
-    fromInteger = Finite
+    (+) = timeTryOrInf3 (+)
+    (*) = timeTryOrInf3 (*)
+    abs = timeTryOrInf abs
+    signum = timeTryOrInf signum
+    fromInteger = Finite . fromInteger
 
 maxTime :: Time -> Time -> Time
 maxTime (Finite x) (Finite y) = Finite $ max x y
@@ -34,30 +48,50 @@ instance Ord Time where
     compare _ Infinite = LT
     compare (Finite x) (Finite y) = compare x y
 
-instance Show Time where
-    show Infinite = show "Infinity"
-    show (Finite x) = show x
+secs :: (RealFrac a) => a -> Time
+secs = fromIntegral . round . (* (1000000000000))
 
-sampleRate :: (Num a) => a
-sampleRate = 44100
+mins :: (RealFrac a) => a -> Time
+mins = secs . (* 60)
 
-bytesPerSample :: (Num a) => a
-bytesPerSample = 2
+inf :: Time
+inf = Infinite
 
+bpm :: (RealFrac a) => a -> a -> Time
 bpm x n = mins (n / x)
-mins n = Finite $ round $ n * 60 * sampleRate
-secs n = Finite $ round $ n * sampleRate
-inf = Infinite :: Time
 
 -- Synth
 
 type Freq = Double
 type Volume = Double
-type WavePoint = Double
-type WavePoint2 = (WavePoint, WavePoint)
+type Point = Double
+newtype Point2 = Point2 (Point, Point) deriving (Eq, Read, Show)
+
+leftApp, rightApp, monoApp :: (Point -> Point) -> Point2 -> Point2
+leftApp f (Point2 (u, v)) = Point2 (f u, v)
+rightApp f (Point2 (u, v)) = Point2 (u, f v)
+monoApp f (Point2 (u, v)) = Point2 (f u, f v)
+
+leftApp2, rightApp2, monoApp2 :: (Point -> Point -> Point) -> Point2 -> Point2 -> Point2
+leftApp2 f (Point2 (u, v)) (Point2 (x, y)) = Point2 (f u x, v)
+rightApp2 f (Point2 (u, v)) (Point2 (x, y)) = Point2 (u, f v y)
+monoApp2 f (Point2 (u, v)) (Point2 (x, y)) = Point2 (f u x, f v y)
+
+mtPoint2 :: Point2
+mtPoint2 = Point2 (0, 0)
+
+instance Num Point2 where
+    (+) = monoApp2 (+)
+    (*) = monoApp2 (*)
+    abs = monoApp abs
+    signum = monoApp signum
+    fromInteger x = Point2 (i, i)
+        where i = fromInteger x
 
 note :: String -> Freq
-note = (/ sampleRate) . noteS
+note =  (/ 1000000000000) . noteS
+
+noteS :: String -> Freq
 noteS "A" = 440.0
 noteS "A#" = 466.16
 noteS "Bb" = 466.16
@@ -77,18 +111,26 @@ noteS "G#" = 830.61
 noteS "Ab" = 830.61
 noteS _ = 440.0
 
-newtype GeneratorFn = GeneratorFn { getGenFn :: Sample -> WavePoint2 }
-newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Sample -> WavePoint2 -> WavePoint2 }
+newtype GeneratorFn = GeneratorFn { getGenFn :: Picosecond -> Point2 }
+newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Picosecond -> Point2 -> Point2 }
 
-mkLeftGen f = GeneratorFn $ \i -> (f $ fromIntegral i, 0)
-mkRightGen f = GeneratorFn $ \i -> (0, f $ fromIntegral i)
-mkMonoGen f = GeneratorFn $ \i -> let x = fromIntegral i in (f x, f x)
-mkStereoGen f = GeneratorFn $ \i -> f $ fromIntegral i
+-- Simple generalized constructors for generators and adjustors
 
-mkLeftAdj f = AdjustmentFn $ \i -> \(l, r) -> (f (fromIntegral i) l, r)
-mkRightAdj f = AdjustmentFn $ \i -> \(l, r) -> (l, f (fromIntegral i) r)
-mkMonoAdj f = AdjustmentFn $ \i -> \(l, r) -> let x = fromIntegral i in (f x l, f x r)
-mkStereoAdj f = AdjustmentFn $ \i -> f $ fromIntegral i
+mkLeftGen, mkRightGen, mkMonoGen :: (Num a) => (a -> Point) -> GeneratorFn
+mkLeftGen f = GeneratorFn $ \i -> Point2 (f . fromIntegral $ i, 0)
+mkRightGen f = GeneratorFn $ \i -> Point2 (0, f . fromIntegral $ i)
+mkMonoGen f = GeneratorFn $ \i -> let g = f (fromIntegral i) in Point2 (g, g)
+
+mkStereoGen :: (Num a) => (a -> (Point, Point)) -> GeneratorFn
+mkStereoGen f = GeneratorFn $ \i -> Point2 $ f (fromIntegral i)
+
+mkLeftAdj, mkRightAdj, mkMonoAdj :: (Num a) => (a -> Point -> Point) -> AdjustmentFn
+mkLeftAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> Point2 (f (fromIntegral i) l, r)
+mkRightAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> Point2 (l, f (fromIntegral i) r)
+mkMonoAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> let g = f (fromIntegral i) in Point2 (g l, g r)
+
+mkStereoAdj :: (Num a) => (a -> (Point, Point) -> (Point, Point)) -> AdjustmentFn
+mkStereoAdj f = AdjustmentFn $ \i -> \(Point2 s) -> Point2 $ f (fromIntegral i) s
 
 -- Player
 
@@ -106,27 +148,26 @@ instance Show Stream where
 
 generationStart :: Stream -> Time
 generationStart (Generator s _ _) = s
-generationStart (Adjustment _ _ _ o) = generationEnd o
+generationStart (Adjustment _ _ _ o) = generationStart o
 
 generationEnd :: Stream -> Time
 generationEnd (Generator _ e _) = e
 generationEnd (Adjustment _ _ _ o) = generationEnd o
 
-evalStreams :: Sample -> [Stream] -> WavePoint2
+evalStreams :: Picosecond -> [Stream] -> Point2
 evalStreams i = clip2 . sum2 . map (evalStream i)
-    where sum2 = foldl accum (0, 0)
-          accum (ls, lr) (l, r) = (ls+l, lr+r)
-          clip2 (l, r) = (clip l, clip r)
+    where sum2 = foldl (+) mtPoint2
+          clip2 = monoApp clip
           clip x | x <= lbound = lbound
                  | x >= ubound = ubound
                  | otherwise = x
           (lbound, ubound) = (-1 + 1e-9, 1 - 1e-9)
 
-evalStream :: Sample -> Stream -> WavePoint2
-evalStream _ (Generator Infinite _ _) = (0,0)
-evalStream i (Generator (Finite s) Infinite g) | i <= s = (0,0)
+evalStream :: Picosecond -> Stream -> Point2
+evalStream _ (Generator Infinite _ _) = mtPoint2
+evalStream i (Generator (Finite s) Infinite g) | i <= s = mtPoint2
                                                | otherwise = (getGenFn g) (i - s)
-evalStream i (Generator (Finite s) (Finite e) g) | i <= s || i > e = (0,0)
+evalStream i (Generator (Finite s) (Finite e) g) | i <= s || i > e = mtPoint2
                                                  | otherwise = (getGenFn g) (i - s)
 evalStream i (Adjustment Infinite _ _ o) = evalStream i o
 evalStream i (Adjustment (Finite s) Infinite a o) | i <= s = evalStream i o
@@ -137,8 +178,7 @@ evalStream i (Adjustment (Finite s) (Finite e) a o) | i <= s || i > e = evalStre
 type StreamKey = Integer
 type PlayerState = State Player
 data Player = Player { allStreams :: M.Map StreamKey Stream
-                     , currentTime :: Time } deriving Show
-
+                     , currentTime :: Time } deriving (Show)
 
 getMaxKey :: (Num k) => M.Map k a -> k
 getMaxKey as = case M.maxViewWithKey as of Nothing -> 0
@@ -147,7 +187,7 @@ getMaxKey as = case M.maxViewWithKey as of Nothing -> 0
 execAndGetStreams :: PlayerState a -> ([Stream], Time)
 execAndGetStreams c = (M.elems as, ct)
     where (Player as ct) = execState c initialState
-          initialState = Player M.empty $ Finite 0
+          initialState = Player M.empty (Finite 0)
 
 play :: Time -> GeneratorFn -> PlayerState StreamKey
 play d g = state $ \(Player as t) ->
@@ -172,21 +212,25 @@ stopAll = state $ \(Player as t) -> ((), Player (M.map (stopIfPlaying t) as) t)
 stop :: StreamKey -> PlayerState StreamKey
 stop k = state $ \(Player as t) -> (k, Player (M.adjust (stopIfPlaying t) k as) t)
 
--- playF = play inf
--- patchF = patch inf
+playF = play inf
+patchF = patch inf
 playAndWait d g = play d g >>= (\k -> wait d >> return k)
 patchAndWait d k a = patch d k a >>= (\k -> wait d >> return k)
 
 -- Encoder
 
-writeWAVFile :: FilePath -> PlayerState a -> IO ()
-writeWAVFile fp = (B.writeFile fp) . genWAVFile
+type Sample = Int64
+type SampleRate = Word32
+type BitsPerSample = Word16
 
-genWAVFile :: PlayerState a -> B.ByteString
-genWAVFile = P.runPut . putWAV . mix . execAndGetStreams
+writeWAVFile :: (Integral a) => FilePath -> SampleRate -> a -> PlayerState b -> IO ()
+writeWAVFile fp sr bps ps = B.writeFile fp $ genWAVFile sr (fromIntegral $ bps `div` 8) ps
 
-putWAV :: (Sample, P.Put) -> P.Put
-putWAV (numSamples, audioDataPut) = do
+genWAVFile :: SampleRate -> BitsPerSample -> PlayerState a -> B.ByteString
+genWAVFile sr bps = P.runPut . (putWAV sr bps) . (mix sr bps) . execAndGetStreams
+
+putWAV :: SampleRate -> BitsPerSample -> (Sample, P.Put) -> P.Put
+putWAV sr bps (numSamples, audioDataPut) = do
     P.putLazyByteString $ B.pack riff
     P.putWord32le $ 36 + sub2Size
     P.putLazyByteString $ B.pack wave
@@ -194,10 +238,10 @@ putWAV (numSamples, audioDataPut) = do
     P.putWord32le 16          -- Subchunk Size
     P.putWord16le 1           -- Audio Format (PCM)
     P.putWord16le 2           -- Num Channels
-    P.putWord32le sampleRate
-    P.putWord32le $ sampleRate * 2 * bytesPerSample
-    P.putWord16le $ 2 * bytesPerSample
-    P.putWord16le $ 8 * bytesPerSample
+    P.putWord32le sr
+    P.putWord32le . fromIntegral $ sr * (fromIntegral bps) * 2
+    P.putWord16le . fromIntegral $ bps * 2
+    P.putWord16le . fromIntegral $ bps * 8
     P.putLazyByteString $ B.pack dataS
     P.putWord32le $ sub2Size
     audioDataPut
@@ -205,28 +249,34 @@ putWAV (numSamples, audioDataPut) = do
               wave = [0x57, 0x41, 0x56, 0x45]
               fmt = [0x66, 0x6d, 0x74, 0x20]
               dataS = [0x64, 0x61, 0x74, 0x61]
-              sub2Size = fromInteger $ numSamples * 2 * bytesPerSample
+              sub2Size = fromIntegral $ numSamples * (fromIntegral bps) * 2
 
-mix :: ([Stream], Time) -> (Sample, P.Put)
-mix (as, t) = (numSamples, mapM_ (encodeStreams as) [1..numSamples])
-    where numSamples = timeToSamples timeSamples
-          timeSamples = foldl maxTime t (map generationEnd as)
-          timeToSamples Infinite = 0
-          timeToSamples (Finite x) = x
+mix :: SampleRate -> BitsPerSample -> ([Stream], Time) -> (Sample, P.Put)
+mix sr bps (as, t) = (numSamples, encodeStreamLoop bps as 0 oneSamplePs endPs)
+    where numSamples = psToSample endPs
+          endPs = timeMaybe 0 id endTime
+          endTime = foldl maxTime t (map generationEnd as)
+          psToSample x = fromIntegral $ sr * round ((fromIntegral x) % 1000000000000)
+          oneSamplePs = round (1000000000000 % sr)
 
-encodeStreams :: [Stream] -> Sample -> P.Put
-encodeStreams as i = do 
+encodeStreamLoop :: BitsPerSample -> [Stream] -> Picosecond -> Picosecond -> Picosecond -> P.Put
+encodeStreamLoop _ _ i _ k | i >= k = return ()
+encodeStreamLoop bps as i j k = do
+    encodeStreams bps as i
+    encodeStreamLoop bps as (i + j) j k
+
+encodeStreams :: BitsPerSample -> [Stream] -> Picosecond -> P.Put
+encodeStreams bps as i = do 
     P.putWord16le $ f l
     P.putWord16le $ f r
-        where (l, r) = evalStreams i as
-              f x = round $ x * 2^(8 * bytesPerSample - 1)
-          -- mapM_ (encodeBytes (f l, f r)) [1..bytesPerSample]
+        where Point2 (l, r) = evalStreams i as
+              f x = round $ x * 2^(bps * 8 - 1)
 
 encodeBytes :: (Int64, Int64) -> Int -> P.Put
 encodeBytes (l, r) n = do
     P.putWord8 $ f l
     P.putWord8 $ f r
-        where f x = fromIntegral x `shiftR` (8 * (n - 1)) .&. 0xff
+        where f x = fromIntegral x `shiftR` (n - 1) .&. 0xff
 
 -- Example
 
@@ -292,4 +342,4 @@ example6 = do
               patch inf x (amplify 1.25)
               wait (secs 1)
 
-main = writeWAVFile "sample.wav" example5
+main = writeWAVFile "sample.wav" 44100 16 example3

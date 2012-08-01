@@ -220,8 +220,8 @@ patchAndWait d k a = patch d k a >>= (\k -> wait d >> return k)
 -- Encoder
 
 type Sample = Int64
-type SampleRate = Word32
-type BitsPerSample = Word16
+type SampleRate = Int64
+type BitsPerSample = Int64
 
 writeWAVFile :: (Integral a) => FilePath -> SampleRate -> a -> PlayerState b -> IO ()
 writeWAVFile fp sr bps ps = B.writeFile fp $ genWAVFile sr (fromIntegral $ bps `div` 8) ps
@@ -232,31 +232,31 @@ genWAVFile sr bps = P.runPut . (putWAV sr bps) . (mix sr bps) . execAndGetStream
 putWAV :: SampleRate -> BitsPerSample -> (Sample, P.Put) -> P.Put
 putWAV sr bps (numSamples, audioDataPut) = do
     P.putLazyByteString $ B.pack riff
-    P.putWord32le $ 36 + sub2Size
+    P.putWord32le . fromIntegral $ 36 + sub2Size
     P.putLazyByteString $ B.pack wave
     P.putLazyByteString $ B.pack fmt
     P.putWord32le 16          -- Subchunk Size
     P.putWord16le 1           -- Audio Format (PCM)
     P.putWord16le 2           -- Num Channels
-    P.putWord32le sr
-    P.putWord32le . fromIntegral $ sr * (fromIntegral bps) * 2
+    P.putWord32le . fromIntegral $ sr
+    P.putWord32le . fromIntegral $ sr * bps * 2
     P.putWord16le . fromIntegral $ bps * 2
     P.putWord16le . fromIntegral $ bps * 8
     P.putLazyByteString $ B.pack dataS
-    P.putWord32le $ sub2Size
+    P.putWord32le . fromIntegral $ sub2Size
     audioDataPut
         where riff = [0x52, 0x49, 0x46, 0x46]
               wave = [0x57, 0x41, 0x56, 0x45]
               fmt = [0x66, 0x6d, 0x74, 0x20]
               dataS = [0x64, 0x61, 0x74, 0x61]
-              sub2Size = fromIntegral $ numSamples * (fromIntegral bps) * 2
+              sub2Size = numSamples * bps * 2
 
 mix :: SampleRate -> BitsPerSample -> ([Stream], Time) -> (Sample, P.Put)
 mix sr bps (as, t) = (numSamples, encodeStreamLoop bps as 0 oneSamplePs endPs)
     where numSamples = psToSample endPs
           endPs = timeMaybe 0 id endTime
           endTime = foldl maxTime t (map generationEnd as)
-          psToSample x = fromIntegral $ sr * round ((fromIntegral x) % 1000000000000)
+          psToSample x = sr * round (x % 1000000000000)
           oneSamplePs = round (1000000000000 % sr)
 
 encodeStreamLoop :: BitsPerSample -> [Stream] -> Picosecond -> Picosecond -> Picosecond -> P.Put

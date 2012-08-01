@@ -1,19 +1,15 @@
-{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleInstances, GeneralizedNewtypeDeriving, TupleSections #-}
 
 module Main where
 
-import Control.Applicative
-import Control.Monad
-import Control.Monad.State
+import Control.Monad.State (State, state, execState)
 import qualified Data.Map as M
 import qualified Data.Binary.Put as P
-import Data.Bits
 import qualified Data.ByteString.Lazy as B
-import Data.Int
+import Data.Bits ((.&.), shiftR)
 import Data.Ratio ((%))
-import Data.List (foldl')
+import Data.Int
 import Data.Word
-import Debug.Trace
 
 -- Time
 
@@ -65,12 +61,15 @@ bpm x n = mins (n / x)
 type Freq = Double
 type Volume = Double
 type Point = Double
-newtype Point2 = Point2 (Point, Point) deriving (Eq, Read, Show)
+newtype Point2 = Point2 { chans :: (Point, Point) } deriving (Eq, Read, Show)
 
 leftApp, rightApp, monoApp :: (Point -> Point) -> Point2 -> Point2
 leftApp f (Point2 (u, v)) = Point2 (f u, v)
 rightApp f (Point2 (u, v)) = Point2 (u, f v)
 monoApp f (Point2 (u, v)) = Point2 (f u, f v)
+
+stereoApp :: ((Point, Point) -> (Point, Point)) -> Point2 -> Point2
+stereoApp f (Point2 s) = Point2 (f s)
 
 leftApp2, rightApp2, monoApp2 :: (Point -> Point -> Point) -> Point2 -> Point2 -> Point2
 leftApp2 f (Point2 (u, v)) (Point2 (x, y)) = Point2 (f u x, v)
@@ -89,27 +88,14 @@ instance Num Point2 where
         where i = fromInteger x
 
 note :: String -> Freq
-note =  (/ 1000000000000) . noteS
+note = (/ 1000000000000) . (notes M.!)
 
-noteS :: String -> Freq
-noteS "A" = 440.0
-noteS "A#" = 466.16
-noteS "Bb" = 466.16
-noteS "B" = 493.88
-noteS "C" = 523.25
-noteS "C#" = 554.37
-noteS "Db" = 554.37
-noteS "D" = 587.33
-noteS "D#" = 622.25
-noteS "Eb" = 622.25
-noteS "E" = 659.26
-noteS "F" = 698.46
-noteS "F#" = 739.99
-noteS "Gb" = 739.99
-noteS "G" = 783.99
-noteS "G#" = 830.61
-noteS "Ab" = 830.61
-noteS _ = 440.0
+notes :: M.Map String Freq
+notes = M.fromList [ ("A", 440.00), ("A#", 466.16), ("Bb", 466.16), ("B", 493.88)
+                   , ("C", 523.25), ("C#", 554.37), ("Db", 554.37), ("D", 587.33)
+                   , ("D#", 622.25), ("Eb", 622.25), ("E", 659.26), ("F", 698.46)
+                   , ("F#", 739.99), ("Gb",739.99), ("G", 783.99), ("G#", 830.61)
+                   , ("Ab", 830.61) ]
 
 newtype GeneratorFn = GeneratorFn { getGenFn :: Picosecond -> Point2 }
 newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Picosecond -> Point2 -> Point2 }
@@ -117,20 +103,20 @@ newtype AdjustmentFn = AdjustmentFn { getAdjFn :: Picosecond -> Point2 -> Point2
 -- Simple generalized constructors for generators and adjustors
 
 mkLeftGen, mkRightGen, mkMonoGen :: (Num a) => (a -> Point) -> GeneratorFn
-mkLeftGen f = GeneratorFn $ \i -> Point2 (f . fromIntegral $ i, 0)
-mkRightGen f = GeneratorFn $ \i -> Point2 (0, f . fromIntegral $ i)
-mkMonoGen f = GeneratorFn $ \i -> let g = f (fromIntegral i) in Point2 (g, g)
+mkLeftGen f = GeneratorFn $ Point2 . (, 0) . f . fromIntegral
+mkRightGen f = GeneratorFn $ Point2 . (0 ,) . f . fromIntegral
+mkMonoGen f = GeneratorFn $ Point2 . (\x -> (x, x)) . f . fromIntegral
 
 mkStereoGen :: (Num a) => (a -> (Point, Point)) -> GeneratorFn
-mkStereoGen f = GeneratorFn $ \i -> Point2 $ f (fromIntegral i)
+mkStereoGen f = GeneratorFn $ Point2 . f . fromIntegral
 
 mkLeftAdj, mkRightAdj, mkMonoAdj :: (Num a) => (a -> Point -> Point) -> AdjustmentFn
-mkLeftAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> Point2 (f (fromIntegral i) l, r)
-mkRightAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> Point2 (l, f (fromIntegral i) r)
-mkMonoAdj f = AdjustmentFn $ \i -> \(Point2 (l, r)) -> let g = f (fromIntegral i) in Point2 (g l, g r)
+mkLeftAdj f = AdjustmentFn $ leftApp . f . fromIntegral
+mkRightAdj f = AdjustmentFn $ rightApp . f . fromIntegral
+mkMonoAdj f = AdjustmentFn $ monoApp . f . fromIntegral
 
 mkStereoAdj :: (Num a) => (a -> (Point, Point) -> (Point, Point)) -> AdjustmentFn
-mkStereoAdj f = AdjustmentFn $ \i -> \(Point2 s) -> Point2 $ f (fromIntegral i) s
+mkStereoAdj f = AdjustmentFn $ stereoApp . f . fromIntegral
 
 -- Player
 
@@ -156,7 +142,7 @@ generationEnd (Adjustment _ _ _ o) = generationEnd o
 
 evalStreams :: Picosecond -> [Stream] -> Point2
 evalStreams i = clip2 . sum2 . map (evalStream i)
-    where sum2 = foldl (+) mtPoint2
+    where sum2 = foldr (+) mtPoint2
           clip2 = monoApp clip
           clip x | x <= lbound = lbound
                  | x >= ubound = ubound
@@ -175,7 +161,7 @@ evalStream i (Adjustment (Finite s) Infinite a o) | i <= s = evalStream i o
 evalStream i (Adjustment (Finite s) (Finite e) a o) | i <= s || i > e = evalStream i o
                                                     | otherwise = (getAdjFn a) (i - s) (evalStream i o)
 
-type StreamKey = Integer
+type StreamKey = Int32
 type PlayerState = State Player
 data Player = Player { allStreams :: M.Map StreamKey Stream
                      , currentTime :: Time } deriving (Show)
@@ -212,10 +198,22 @@ stopAll = state $ \(Player as t) -> ((), Player (M.map (stopIfPlaying t) as) t)
 stop :: StreamKey -> PlayerState StreamKey
 stop k = state $ \(Player as t) -> (k, Player (M.adjust (stopIfPlaying t) k as) t)
 
+playF :: GeneratorFn -> PlayerState StreamKey
 playF = play inf
+
+patchF :: StreamKey -> AdjustmentFn -> PlayerState StreamKey
 patchF = patch inf
+
+playAndWait :: Time -> GeneratorFn -> PlayerState StreamKey
 playAndWait d g = play d g >>= (\k -> wait d >> return k)
+
+patchAndWait :: Time -> StreamKey -> AdjustmentFn -> PlayerState StreamKey
 patchAndWait d k a = patch d k a >>= (\k -> wait d >> return k)
+
+repeatM :: (Integral a) => a -> PlayerState b -> PlayerState b
+repeatM x m = repeatLoop x m
+    where repeatLoop x acc | x <= 1 = acc
+                           | otherwise = repeatLoop (x - 1) (acc >> m)
 
 -- Encoder
 
@@ -252,25 +250,25 @@ putWAV sr bps (numSamples, audioDataPut) = do
               sub2Size = numSamples * bps * 2
 
 mix :: SampleRate -> BitsPerSample -> ([Stream], Time) -> (Sample, P.Put)
-mix sr bps (as, t) = (numSamples, encodeStreamLoop bps as 0 oneSamplePs endPs)
+mix sr bps (as, t) = (numSamples, encodeStreams bps as 0 oneSamplePs endPs)
     where numSamples = psToSample endPs
           endPs = timeMaybe 0 id endTime
-          endTime = foldl maxTime t (map generationEnd as)
+          endTime = foldr maxTime t (map generationEnd as)
           psToSample x = sr * round (x % 1000000000000)
           oneSamplePs = round (1000000000000 % sr)
 
-encodeStreamLoop :: BitsPerSample -> [Stream] -> Picosecond -> Picosecond -> Picosecond -> P.Put
-encodeStreamLoop _ _ i _ k | i >= k = return ()
-encodeStreamLoop bps as i j k = do
-    encodeStreams bps as i
-    encodeStreamLoop bps as (i + j) j k
+encodeStreams :: BitsPerSample -> [Stream] -> Picosecond -> Picosecond -> Picosecond -> P.Put
+encodeStreams bps as i j k = encodeStreamLoop i k
+    where encodeStreamLoop i k | i >= k = return ()
+                               | otherwise = do
+                                    encodeStreams i
+                                    encodeStreamLoop (i+j) k
+          encodeStreams i = do
+                let Point2 (l, r) = evalStreams i as
+                P.putWord16le $ norm l
+                P.putWord16le $ norm r
+          norm x = round $ x * 2^(bps * 8 - 1)
 
-encodeStreams :: BitsPerSample -> [Stream] -> Picosecond -> P.Put
-encodeStreams bps as i = do 
-    P.putWord16le $ f l
-    P.putWord16le $ f r
-        where Point2 (l, r) = evalStreams i as
-              f x = round $ x * 2^(bps * 8 - 1)
 
 encodeBytes :: (Int64, Int64) -> Int -> P.Put
 encodeBytes (l, r) n = do
@@ -281,18 +279,23 @@ encodeBytes (l, r) n = do
 -- Example
 
 sine :: Freq -> Volume -> GeneratorFn
-sine f v = mkMonoGen $ \i -> v * (sin $ 2 * pi * i * f)
+sine f v = mkMonoGen g
+    where g i = v * (sin $ 2 * pi * i * f)
 
 sawtooth :: Freq -> Volume -> GeneratorFn
-sawtooth f v = mkMonoGen $ \i -> let x = i * f in 2 * v * (x - fromIntegral (floor x) - 0.5)
+sawtooth f v = mkMonoGen g
+    where g i = 2 * v * (x - fromIntegral (floor x) - 0.5)
+                where x = i * f
 
 amplify :: Volume -> AdjustmentFn
-amplify v = mkMonoAdj $ \_ -> \x -> v * x
+amplify v = mkMonoAdj g
+    where g _ x = v * x
 
 fadeIn :: Time -> AdjustmentFn
-fadeIn Infinite = mkMonoAdj $ \_ -> \_ -> 0
-fadeIn (Finite s) = mkMonoAdj $ \i -> \x -> if i < t then (t - i) * x else x
-    where t = fromIntegral s
+fadeIn Infinite = mkMonoAdj $ const . const 0
+fadeIn (Finite s) = mkMonoAdj g
+    where g i x = if i < t then (t - i) * x else x
+          t = fromIntegral s
 
 -- Examples
 
@@ -342,4 +345,4 @@ example6 = do
               patch inf x (amplify 1.25)
               wait (secs 1)
 
-main = writeWAVFile "sample.wav" 44100 16 example3
+main = writeWAVFile "sample.wav" 44100 16 example4
